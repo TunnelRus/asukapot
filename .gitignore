@@ -1,0 +1,31 @@
+# Environment secrets (NEVER commit these)
+.env
+.env.local
+.env.*
+
+# Python runtime & byte-code cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Local database files (backed up automatically via Cloud Sync)
+*.db
+*.db-journal
+*.sqlite3
+
+# Log files
+*.log
+logs/
+
+# IDE / Operating System metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

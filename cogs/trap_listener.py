@@ -21,7 +21,6 @@ class TrapListener(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # 1. Type guard: Ignore DMs, bots, and non-text channels
         if not message.guild or message.author.bot:
             return
 
@@ -35,7 +34,7 @@ class TrapListener(commands.Cog):
         channel: discord.TextChannel = message.channel
         guild: discord.Guild = message.guild
 
-        # 2. Master Owner Permanent Immunity
+        # 1. Owner Immunity
         if author.id in OWNER_IDS:
             return
 
@@ -46,7 +45,7 @@ class TrapListener(commands.Cog):
         if channel.id != settings["trap_channel_id"]:
             return
 
-        # 3. Staff Immunity
+        # 2. Staff Immunity
         if author.guild_permissions.administrator or author.guild_permissions.manage_guild:
             try:
                 await message.delete()
@@ -58,7 +57,7 @@ class TrapListener(commands.Cog):
                 pass
             return
 
-        # 4. Whitelist Exemption
+        # 3. Whitelist Exemption
         whitelist = await cache.get_whitelist(guild.id)
         if author.id in whitelist or any(role.id in whitelist for role in author.roles):
             try:
@@ -71,7 +70,7 @@ class TrapListener(commands.Cog):
                 pass
             return
 
-        # 5. Role Hierarchy Check
+        # 4. Role Hierarchy Check
         can_punish, reason_hierarchy = can_punish_member(guild, author)
         if not can_punish:
             logger.warning(f"Cannot punish {author} in {guild.name}: {reason_hierarchy}")
@@ -82,35 +81,29 @@ class TrapListener(commands.Cog):
         cleanup_hours = settings.get("cleanup_hours", 1)
         active_scenario = settings.get("active_scenario", "decoy_operator")
 
-        # 6. Evaluate threat heuristics
+        # 5. Evaluate threat heuristics
         evaluation = threat_engine.evaluate(author, raw_content)
 
-        # 7. Execute persona containment behavior
+        # 6. Deception persona delay
         await persona_service.execute_scenario(active_scenario, channel, author)
 
-        # 8. Delete intruder message
+        # 7. Delete intruder message
         try:
             await message.delete()
         except discord.DiscordException:
             pass
 
-        # 9. Progressive reputation update
+        # 8. Update reputation record
         reputation = await reputation_repo.record_offense(
             user_id=author.id,
             penalty_points=evaluation.score,
             tag=evaluation.verdict
         )
 
-        if settings.get("auto_escalate", 1) and reputation.current_escalation.value in ("SOFTBAN", "BAN"):
-            if reputation.current_escalation.value == "BAN" and action != "ban":
-                action = "ban"
+        # 9. ALWAYS generate a 1-use invite for softban, kick, AND ban
+        invite_url = await create_single_use_invite(guild)
 
-        # 10. Generate 1-use invite for recoverable punishments
-        invite_url = None
-        if action in ("softban", "kick"):
-            invite_url = await create_single_use_invite(guild)
-
-        # 11. Send recovery instructions to user
+        # 10. Send recovery DM with the 1-use invite
         try:
             dm_embed = create_softban_dm_embed(
                 guild_name=guild.name,
@@ -121,14 +114,15 @@ class TrapListener(commands.Cog):
         except Exception:
             pass
 
-        # 12. Execute punishment
-        audit_reason = f"asukaPot Interception: #{channel.name} | Risk: {evaluation.score}/100"
+        # 11. Execute punishment
+        audit_reason = f"asukaPot: #{channel.name} | Threat: {evaluation.verdict}"
         ban_days = cleanup_hours_to_ban_days(cleanup_hours)
 
         try:
             if action == "softban":
+                # Ban to wipe messages, then unban immediately so the invite link works
                 await guild.ban(author, reason=audit_reason, delete_message_days=ban_days)
-                await guild.unban(author, reason="asukaPot softban cleanup complete.")
+                await guild.unban(author, reason="asukaPot softban cleanup complete: account free to rejoin via invite.")
             elif action == "ban":
                 await guild.ban(author, reason=audit_reason, delete_message_days=ban_days)
             elif action == "kick":
@@ -139,7 +133,7 @@ class TrapListener(commands.Cog):
             logger.error(f"Missing permissions to enforce {action} on {author}.")
             return
 
-        # 13. Register formal security incident
+        # 12. Register incident
         incident = await incident_service.register_incident(
             guild=guild,
             member=author,
@@ -149,13 +143,13 @@ class TrapListener(commands.Cog):
             action_taken=action
         )
 
-        # 14. Update metrics and notify subsystems
+        # 13. Update metrics and notify subsystems
         new_catches = await guild_repo.increment_catches(guild.id)
         cache.invalidate(guild.id)
 
         self.bot.dispatch("honeypot_trigger", guild, author, action, raw_content, incident)
 
-        # 15. Refresh live honeypot card
+        # 14. Refresh live honeypot card
         trap_msg_id = settings.get("trap_message_id")
         if trap_msg_id:
             try:

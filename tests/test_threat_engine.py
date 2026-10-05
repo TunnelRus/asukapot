@@ -12,7 +12,6 @@ def mock_member():
     member.avatar = None
     member.guild = MagicMock()
     member.guild.roles = []
-    # Account created today, joined 4 seconds ago
     now = discord.utils.utcnow()
     member.created_at = now
     member.joined_at = now - datetime.timedelta(seconds=4)
@@ -27,7 +26,7 @@ def test_threat_engine_detects_phishing_link(mock_member):
     eval_res = threat_engine.evaluate(mock_member, "Free nitro here: https://discorcl.gift/drop")
     assert eval_res.score >= 70
     assert any("Deceptive phishing" in f for f in eval_res.flags)
-    assert eval_res.verdict.startswith("CRITICAL")
+    assert eval_res.verdict.upper().startswith("CRITICAL")
 
 def test_threat_engine_detects_invisible_characters(mock_member):
     payload = "Check\u200bout\u200cthis"

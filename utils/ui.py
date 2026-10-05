@@ -61,6 +61,7 @@ def create_softban_dm_embed(guild_name: str, action: str, invite_url: str | None
     )
     embed.set_thumbnail(url=PANIC_AVATAR_URL)
 
+    # Rejoin link is included for bans, softbans, and kicks
     if invite_url:
         embed.add_field(
             name="Rejoin Link (Valid for 7 Days • 1 Use)",
@@ -71,28 +72,25 @@ def create_softban_dm_embed(guild_name: str, action: str, invite_url: str | None
 
 def create_incident_embed(incident: Incident) -> discord.Embed:
     embed = discord.Embed(
-        title=f"Incident File: {incident.incident_id}",
-        description=f"**{incident.title}**\n{incident.summary}",
+        title="Caught someone in the trap",
+        description=f"**{incident.user_name}** triggered the honeypot.",
         color=COLOR_CRIMSON if incident.severity.value in ("CRITICAL", "HIGH") else COLOR_AMBER,
         timestamp=incident.created_at
     )
-    embed.add_field(name="Severity", value=f"`{incident.severity.value}`", inline=True)
-    embed.add_field(name="Status", value=f"`{incident.status.value}`", inline=True)
-    embed.add_field(name="Risk Score", value=f"`{incident.risk_score}/100`", inline=True)
-    embed.add_field(name="Correlation ID", value=f"`{incident.correlation_id}`", inline=True)
+    embed.add_field(name="Account", value=f"<@{incident.user_id}>\n`{incident.user_name}`", inline=True)
+    embed.add_field(name="Action Taken", value=f"**{incident.evidence.get('action_executed', 'softban').upper()}**", inline=True)
+    embed.add_field(name="Threat Level", value=f"**{incident.severity.value.capitalize()}**", inline=True)
 
-    evidence = incident.evidence
-    embed.add_field(name="Join Delta", value=evidence.get("join_delta", "N/A"), inline=True)
-    embed.add_field(name="Entropy", value=str(evidence.get("entropy", "N/A")), inline=True)
-
-    flags = evidence.get("flags", [])
+    flags = incident.evidence.get("flags", [])
     if flags:
-        embed.add_field(name="Flags", value="\n".join([f"• {f}" for f in flags])[:1000], inline=False)
+        clean_flags = "\n".join([f"• {f}" for f in flags])
+        embed.add_field(name="Why it was flagged", value=clean_flags[:1000], inline=False)
 
-    if incident.notes:
-        embed.add_field(name="Case Notes", value="\n".join(incident.notes)[-1000:], inline=False)
+    raw_msg = incident.evidence.get("raw_content", "")
+    if raw_msg and raw_msg != "[Empty / Embed / Attachment]":
+        embed.add_field(name="Intercepted Message", value=f"```{raw_msg[:900]}```", inline=False)
 
-    embed.set_footer(text="asukaPot Incident Management Subsystem")
+    embed.set_footer(text=f"Incident {incident.incident_id}")
     return embed
 
 class HoneypotPersistentView(discord.ui.View):
@@ -124,41 +122,41 @@ class HoneypotPersistentView(discord.ui.View):
 
 def build_help_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="asukaPot Security Suite • Command Manual",
-        description="Autonomous defense, incident investigation, and honeypot persona management.",
+        title="asukaPot Security Guide",
+        description="A complete guide to managing your honeypot traps and investigating threats.",
         color=COLOR_NEUTRAL
     )
     embed.add_field(
         name="Configuration",
         value=(
-            "**/honeypot setup [channel]** — Arms channel and deploys the trap card.\n"
+            "**/honeypot setup [channel]** — Arms a channel and deploys the trap card.\n"
             "**/honeypot disarm** — Safely deactivates honeypot mode.\n"
-            "**/honeypot action [action] [cleanup_hours]** — Sets containment action and message purge window.\n"
-            "**/honeypot logs [channel]** — Designates moderation security log stream.\n"
-            "**/honeypot scenario [name]** — Sets deception mode (`decoy_operator`, `canary_leak`, `silent`)."
+            "**/honeypot action [action] [cleanup_hours]** — Sets punishment (`Softban`, `Ban`, `Kick`, `Timeout`).\n"
+            "**/honeypot scenario [mode]** — Chooses deception persona (`decoy_operator`, `canary_leak`, `silent`).\n"
+            "**/honeypot logs [channel]** — Sets your moderation security log channel."
         ),
         inline=False
     )
     embed.add_field(
-        name="Forensics & Investigation",
+        name="Investigation & Tools",
         value=(
-            "**/honeypot incident view [id]** — Inspects full evidence card and correlation logs.\n"
-            "**/honeypot incident resolve [id] [note]** — Resolves an open case with staff audit notes.\n"
-            "**/honeypot user lookup [user]** — Checks cross-server reputation, penalties, and tenure.\n"
-            "**/honeypot test rule [text]** — Evaluates payload against threat heuristics.\n"
-            "**/honeypot health** — Displays diagnostics, database status, and cache integrity."
+            "**/honeypot user lookup [user]** — Checks an account's cross-server threat history and previous catches.\n"
+            "**/honeypot incident view [id]** — Inspects full evidence for a case file.\n"
+            "**/honeypot test rule [text]** — Tests how the threat engine evaluates a sample message.\n"
+            "**/honeypot ping** — Quick WebSocket and database latency check.\n"
+            "**/honeypot health** — Complete system diagnostics and uptime metrics.\n"
+            "**/honeypot upgrade** — Refreshes the pinned trap card to the latest release."
         ),
         inline=False
     )
     embed.add_field(
-        name="Access Control",
+        name="Whitelist",
         value=(
-            "**/honeypot whitelist add [target]** — Grants exemption to a role or user.\n"
-            "**/honeypot whitelist remove [target]** — Revokes honeypot exemption.\n"
-            "**/honeypot status** — Summary of active settings and catch statistics.\n"
-            "**/honeypot sync** — Purges local client cache and resynchronizes slash commands."
+            "**/honeypot whitelist add [role/user]** — Grants exemption from the trap.\n"
+            "**/honeypot whitelist remove [role/user]** — Revokes exemption.\n"
+            "**/honeypot status** — Summary of active settings and catch statistics."
         ),
         inline=False
     )
-    embed.set_footer(text="asukaPot Platform • Zero-tolerance automated protection")
+    embed.set_footer(text="asukaPot Security Platform")
     return embed

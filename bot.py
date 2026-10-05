@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import datetime
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -10,6 +11,7 @@ from database.core import init_database
 from utils.ui import HoneypotPersistentView
 from utils.db_sync import restore_database_from_discord, backup_database_to_discord
 from repositories.incident_repository import incident_repo
+from services.fleet_service import fleet_service
 from config import DISCORD_TOKEN, DEV_GUILD_ID, BOT_ACTIVITY_NAME
 
 logging.basicConfig(
@@ -38,12 +40,13 @@ class HoneypotBot(commands.Bot):
             intents=INTENTS,
             help_command=None
         )
+        self.start_time: datetime.datetime = discord.utils.utcnow()
 
     async def setup_hook(self):
         # 1. Launch HTTP health-check server for UptimeRobot
         await start_web_server()
 
-        # 2. Cloud DB recovery
+        # 2. Cloud DB recovery from Discord private channel
         await restore_database_from_discord(self)
 
         # 3. Database initialization and migrations
@@ -105,11 +108,14 @@ class HoneypotBot(commands.Bot):
             logger.info(f"Logged in as {self.user.name} ({self.user.id})")
         else:
             logger.info("Logged in successfully.")
-            
+
         await self.change_presence(
             activity=discord.CustomActivity(name=BOT_ACTIVITY_NAME),
             status=discord.Status.online
         )
+
+        # Auto-upgrade all armed honeypots across servers
+        await fleet_service.auto_upgrade_fleet(self)
 
 bot = HoneypotBot()
 

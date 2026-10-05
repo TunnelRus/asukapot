@@ -1,28 +1,23 @@
+import time
+from typing import Union
 import discord
 from discord import app_commands
 from discord.ext import commands
-from typing import Union
-from config import OWNER_IDS
+
 from utils.cache import cache
 from utils.helpers import is_admin_or_owner, check_bot_channel_permissions
 from utils.ui import (
     create_honeypot_embed, 
     create_disarmed_embed, 
     build_help_embed, 
+    create_incident_embed,
     HoneypotPersistentView
 )
-from database.queries import (
-    upsert_trap_config, 
-    disarm_trap,
-    update_punishment, 
-    update_log_channel, 
-    get_guild_settings,
-    get_recent_incidents,
-    add_whitelist,
-    remove_whitelist,
-    get_guild_whitelist
-)
-from config import COLOR_SUCCESS
+from repositories.guild_repository import guild_repo
+from repositories.incident_repository import incident_repo
+from repositories.reputation_repository import reputation_repo
+from services.threat_engine import threat_engine
+from config import COLOR_SUCCESS, COLOR_INFO
 
 class AdminPanel(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -30,35 +25,60 @@ class AdminPanel(commands.Cog):
 
     honeypot_group = app_commands.Group(
         name="honeypot",
-        description="Configure and manage the honeypot security system."
+        description="Configure and manage the honeypot security platform."
     )
 
     whitelist_subgroup = app_commands.Group(
         name="whitelist",
-        description="Manage roles and users that are immune to the honeypot.",
+        description="Manage roles and accounts exempted from honeypot containment.",
+        parent=honeypot_group
+    )
+
+    incident_subgroup = app_commands.Group(
+        name="incident",
+        description="Investigate and manage security incidents.",
+        parent=honeypot_group
+    )
+
+    user_subgroup = app_commands.Group(
+        name="user",
+        description="Inspect reputation and threat history of accounts.",
+        parent=honeypot_group
+    )
+
+    test_subgroup = app_commands.Group(
+        name="test",
+        description="Testing and simulation sandbox.",
         parent=honeypot_group
     )
 
     @honeypot_group.command(name="help", description="View the Honeypot manual, setup instructions, and command list.")
     async def help_command(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         embed = build_help_embed()
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @honeypot_group.command(name="setup", description="Arms a channel and posts the trap message.")
+    @honeypot_group.command(name="setup", description="Arms a channel and deploys the trap message.")
     @app_commands.describe(channel="The channel you want to turn into a trap.")
-    async def setup(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+    async def setup_cmd(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        guild_id: int = interaction.guild_id
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
 
         valid, msg = check_bot_channel_permissions(channel)
         if not valid:
             await interaction.followup.send(f"**Configuration Error:** {msg}", ephemeral=True)
             return
 
-        settings = await cache.get(interaction.guild_id) or {}
+        settings = await cache.get(guild_id) or {}
         action = settings.get("action", "softban")
         cleanup_hours = settings.get("cleanup_hours", 1)
         catches = settings.get("total_catches", 0)
@@ -67,8 +87,8 @@ class AdminPanel(commands.Cog):
         view = HoneypotPersistentView(catches=catches)
         deployed_msg = await channel.send(embed=embed, view=view)
 
-        await upsert_trap_config(interaction.guild_id, channel.id, deployed_msg.id)
-        cache.invalidate(interaction.guild_id)
+        await guild_repo.upsert_trap(guild_id, channel.id, deployed_msg.id)
+        cache.invalidate(guild_id)
 
         await interaction.followup.send(
             f"**Honeypot Active:** Trap successfully deployed in {channel.mention}.",
@@ -76,23 +96,29 @@ class AdminPanel(commands.Cog):
         )
 
     @honeypot_group.command(name="disarm", description="Disarms the honeypot and makes the channel safe to type in again.")
-    async def disarm(self, interaction: discord.Interaction):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
-            return
-
+    async def disarm_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        old_channel_id, old_message_id = await disarm_trap(interaction.guild_id)
-        cache.invalidate(interaction.guild_id)
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        guild: discord.Guild = interaction.guild
+        guild_id: int = interaction.guild_id
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
+
+        old_channel_id, old_message_id = await guild_repo.disarm(guild_id)
+        cache.invalidate(guild_id)
 
         if not old_channel_id:
             await interaction.followup.send("There is no active honeypot configured on this server.", ephemeral=True)
             return
 
-        # Clean up or update the old trap embed
-        channel = interaction.guild.get_channel(old_channel_id)
-        if channel:
+        channel = guild.get_channel(old_channel_id)
+        if isinstance(channel, discord.TextChannel):
             try:
                 msg = await channel.fetch_message(old_message_id)
                 disarm_embed = create_disarmed_embed()
@@ -100,10 +126,13 @@ class AdminPanel(commands.Cog):
             except discord.DiscordException:
                 pass
 
-        await interaction.followup.send(
-            f"**Honeypot Disarmed:** The trap in <#{old_channel_id}> has been deactivated. It is now safe to type in that channel.",
-            ephemeral=True
-        )
+        try:
+            await interaction.followup.send(
+                f"**Honeypot Disarmed:** The trap in <#{old_channel_id}> has been deactivated.",
+                ephemeral=True
+            )
+        except discord.NotFound:
+            pass
 
     @honeypot_group.command(name="action", description="Change the punishment and message cleanup window.")
     @app_commands.describe(
@@ -116,118 +145,299 @@ class AdminPanel(commands.Cog):
         app_commands.Choice(name="Kick from server", value="kick"),
         app_commands.Choice(name="Timeout for 28 Days", value="timeout")
     ])
-    async def action(
+    async def action_cmd(
         self, 
         interaction: discord.Interaction, 
         action: app_commands.Choice[str], 
         cleanup_hours: app_commands.Range[int, 1, 168] = 1
     ):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
             return
 
-        await update_punishment(interaction.guild_id, action.value, cleanup_hours)
-        cache.invalidate(interaction.guild_id)
+        guild_id: int = interaction.guild_id
 
-        await interaction.response.send_message(
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
+
+        await guild_repo.set_action(guild_id, action.value, cleanup_hours)
+        cache.invalidate(guild_id)
+
+        await interaction.followup.send(
             f"**Updated Settings:** Action set to **{action.name}** with a **{cleanup_hours} hour(s)** message cleanup window.",
+            ephemeral=True
+        )
+
+    @honeypot_group.command(name="scenario", description="Select the active honeypot persona and response profile.")
+    @app_commands.describe(mode="Deception scenario mode.")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Decoy Operator (Natural typing jitter)", value="decoy_operator"),
+        app_commands.Choice(name="Canary Leak (Simulates verification challenge)", value="canary_leak"),
+        app_commands.Choice(name="Silent (Immediate silent purge)", value="silent")
+    ])
+    async def scenario_cmd(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        guild_id: int = interaction.guild_id
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
+
+        await guild_repo.set_scenario(guild_id, mode.value)
+        cache.invalidate(guild_id)
+
+        await interaction.followup.send(
+            f"**Scenario Updated:** Honeypot deception profile set to **{mode.name}**.",
             ephemeral=True
         )
 
     @honeypot_group.command(name="logs", description="Designate a channel for incident reports.")
     @app_commands.describe(channel="Channel where caught accounts are reported.")
-    async def logs(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+    async def logs_cmd(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
             return
 
-        await update_log_channel(interaction.guild_id, channel.id)
-        cache.invalidate(interaction.guild_id)
+        guild_id: int = interaction.guild_id
 
-        await interaction.response.send_message(
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
+
+        await guild_repo.set_logs(guild_id, channel.id)
+        cache.invalidate(guild_id)
+
+        await interaction.followup.send(
             f"**Logs Configured:** Incident reports will be sent to {channel.mention}.",
             ephemeral=True
         )
 
     @honeypot_group.command(name="status", description="Check current honeypot settings and recent incidents.")
-    async def status(self, interaction: discord.Interaction):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+    async def status_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
             return
 
-        settings = await get_guild_settings(interaction.guild_id)
+        guild: discord.Guild = interaction.guild
+        guild_id: int = interaction.guild_id
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions to use this command.", ephemeral=True)
+            return
+
+        settings = await guild_repo.get_settings(guild_id)
         if not settings or not settings.get("trap_channel_id"):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "**Not Configured:** The honeypot is currently not active on this server. Use `/honeypot setup` to arm a channel.",
                 ephemeral=True
             )
             return
 
-        trap_channel = interaction.guild.get_channel(settings["trap_channel_id"])
-        log_channel = interaction.guild.get_channel(settings["log_channel_id"]) if settings["log_channel_id"] else None
-        whitelist_ids = await get_guild_whitelist(interaction.guild_id)
+        trap_channel = guild.get_channel(settings["trap_channel_id"])
+        log_channel = guild.get_channel(settings["log_channel_id"]) if settings["log_channel_id"] else None
+        whitelist_ids = await guild_repo.get_whitelist(guild_id)
 
         embed = discord.Embed(title="Honeypot System Status", color=COLOR_SUCCESS)
         embed.add_field(name="Trap Channel", value=trap_channel.mention if trap_channel else "*Missing/Deleted*", inline=True)
         embed.add_field(name="Log Channel", value=log_channel.mention if log_channel else "*Disabled*", inline=True)
         embed.add_field(name="Punishment Mode", value=f"`{settings['action'].upper()}`", inline=True)
+        embed.add_field(name="Deception Scenario", value=f"`{settings.get('active_scenario', 'decoy_operator')}`", inline=True)
         embed.add_field(name="Cleanup Window", value=f"`{settings['cleanup_hours']} hour(s)`", inline=True)
         embed.add_field(name="Total Catches", value=f"**{settings['total_catches']}**", inline=True)
-        embed.add_field(name="Whitelisted Roles/Users", value=f"{len(whitelist_ids)}", inline=True)
+        embed.add_field(name="Whitelisted Entities", value=f"{len(whitelist_ids)}", inline=True)
 
-        recent = await get_recent_incidents(interaction.guild_id, limit=3)
+        recent = await incident_repo.get_guild_incidents(guild_id, limit=3)
         if recent:
-            lines = [f"• `{r['caught_at'][:16]}` | **{r['user_name']}** (`{r['action_taken'].upper()}`)" for r in recent]
-            embed.add_field(name="Recent Catches", value="\n".join(lines), inline=False)
+            lines = [f"• `{r.created_at.strftime('%Y-%m-%d %H:%M')}` | **{r.user_name}** (`{r.severity.value}`)" for r in recent]
+            embed.add_field(name="Recent Incidents", value="\n".join(lines), inline=False)
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @incident_subgroup.command(name="view", description="Inspect an incident case file by ID.")
+    @app_commands.describe(incident_id="The incident ID (e.g. INC-20261005-XXXXXX)")
+    async def incident_view(self, interaction: discord.Interaction, incident_id: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        incident = await incident_repo.get_incident(incident_id.strip().upper())
+        if not incident or incident.guild_id != interaction.guild_id:
+            await interaction.followup.send(f"Incident `{incident_id}` not found for this server.", ephemeral=True)
+            return
+
+        embed = create_incident_embed(incident)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @incident_subgroup.command(name="resolve", description="Close an incident case with an audit note.")
+    @app_commands.describe(incident_id="The incident ID to resolve", note="Resolution rationale")
+    async def incident_resolve(self, interaction: discord.Interaction, incident_id: str, note: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        success = await incident_repo.resolve_incident(incident_id.strip().upper(), f"{interaction.user.name}: {note}")
+        if success:
+            await interaction.followup.send(f"Case `{incident_id}` successfully resolved.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Could not resolve `{incident_id}`: Case not found.", ephemeral=True)
+
+    @user_subgroup.command(name="lookup", description="Inspect cross-server threat score and history of an account.")
+    @app_commands.describe(user="The member to evaluate")
+    async def user_lookup(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        rep = await reputation_repo.get_or_create(user.id)
+
+        embed = discord.Embed(
+            title=f"Actor Profile: {user.name}",
+            description=f"Cross-server behavioral threat reputation: `{rep.reputation_score}/100`",
+            color=COLOR_INFO
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="Offenses Logged", value=str(rep.offense_count), inline=True)
+        embed.add_field(name="Current Escalation", value=f"`{rep.current_escalation.value}`", inline=True)
+        embed.add_field(name="First Seen", value=discord.utils.format_dt(rep.first_seen, style="R"), inline=True)
+        embed.add_field(name="Tags", value=", ".join(rep.tags) if rep.tags else "None", inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @test_subgroup.command(name="rule", description="Sandbox evaluation of message text against the ThreatEngine.")
+    @app_commands.describe(text="The sample message payload to evaluate")
+    async def test_rule(self, interaction: discord.Interaction, text: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        member: discord.Member = interaction.user
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        eval_res = threat_engine.evaluate(member, text)
+
+        embed = discord.Embed(title="ThreatEngine Sandbox Evaluation", color=COLOR_INFO)
+        embed.add_field(name="Risk Score", value=eval_res.risk_bar, inline=True)
+        embed.add_field(name="Verdict", value=f"`{eval_res.verdict}`", inline=True)
+        embed.add_field(name="Entropy", value=str(eval_res.entropy), inline=True)
+        embed.add_field(name="Flags Triggered", value="\n".join([f"• {f}" for f in eval_res.flags]), inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @honeypot_group.command(name="health", description="System diagnostics, latency, and database integrity.")
+    async def health_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        guild_id: int = interaction.guild_id
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        start = time.perf_counter()
+        _ = await guild_repo.get_settings(guild_id)
+        db_latency = (time.perf_counter() - start) * 1000
+
+        embed = discord.Embed(title="System Health & Integrity Matrix", color=COLOR_SUCCESS)
+        embed.add_field(name="Gateway Latency", value=f"{round(self.bot.latency * 1000, 1)}ms", inline=True)
+        embed.add_field(name="Database Ping", value=f"{db_latency:.2f}ms", inline=True)
+        embed.add_field(name="Active Guilds", value=str(len(self.bot.guilds)), inline=True)
+        embed.add_field(name="Cached Guilds", value=str(len(cache._cache)), inline=True)
+        embed.add_field(name="Uptime Status", value="Nominal • All subsystems operational", inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @whitelist_subgroup.command(name="add", description="Add a role or user to the honeypot whitelist.")
     @app_commands.describe(target="The role or user to whitelist.")
     async def whitelist_add(self, interaction: discord.Interaction, target: Union[discord.Role, discord.Member]):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        guild_id: int = interaction.guild_id
+
         if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
             return
 
         target_type = "role" if isinstance(target, discord.Role) else "user"
-        await add_whitelist(interaction.guild_id, target.id, target_type)
-        cache.invalidate(interaction.guild_id)
+        await guild_repo.add_whitelist(guild_id, target.id, target_type)
+        cache.invalidate(guild_id)
 
-        await interaction.response.send_message(
-            f"**Whitelisted:** {target.mention} will no longer trigger the honeypot.",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"**Whitelisted:** {target.mention} will no longer trigger the honeypot.", ephemeral=True)
 
     @whitelist_subgroup.command(name="remove", description="Remove a role or user from the whitelist.")
     @app_commands.describe(target="The role or user to remove.")
     async def whitelist_remove(self, interaction: discord.Interaction, target: Union[discord.Role, discord.Member]):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild_id:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
             return
 
-        await remove_whitelist(interaction.guild_id, target.id)
-        cache.invalidate(interaction.guild_id)
+        guild_id: int = interaction.guild_id
 
-        await interaction.response.send_message(
-            f"**Removed:** {target.mention} is no longer immune to the honeypot.",
-            ephemeral=True
-        )
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        await guild_repo.remove_whitelist(guild_id, target.id)
+        cache.invalidate(guild_id)
+
+        await interaction.followup.send(f"**Removed:** {target.mention} is no longer exempt.", ephemeral=True)
 
     @honeypot_group.command(name="sync", description="Cleans up and re-registers slash commands to fix duplicates.")
     async def sync_commands(self, interaction: discord.Interaction):
-        if not is_admin_or_owner(interaction):
-            await interaction.response.send_message("You need Administrator permissions to use this command.", ephemeral=True)
-            return
-
         await interaction.response.defer(ephemeral=True)
 
-        self.bot.tree.clear_commands(guild=interaction.guild)
-        await self.bot.tree.sync(guild=interaction.guild)
+        if not interaction.guild:
+            await interaction.followup.send("This command must be run inside a server.", ephemeral=True)
+            return
+
+        guild: discord.Guild = interaction.guild
+
+        if not is_admin_or_owner(interaction):
+            await interaction.followup.send("You need Administrator permissions.", ephemeral=True)
+            return
+
+        self.bot.tree.clear_commands(guild=guild)
+        await self.bot.tree.sync(guild=guild)
         synced = await self.bot.tree.sync()
 
         await interaction.followup.send(
-            f"**Commands Refreshed:** Registered {len(synced)} global commands. "
-            "If Discord still displays duplicates, press Ctrl + R to refresh your client.",
+            f"**Commands Refreshed:** Registered {len(synced)} global commands. (Press Ctrl + R to refresh Discord cache).",
             ephemeral=True
         )
 
